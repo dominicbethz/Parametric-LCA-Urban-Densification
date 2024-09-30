@@ -1,0 +1,915 @@
+import numpy as np
+import pandas as pd
+import data_prep as dp
+
+
+class Building(object):
+
+    def __init__(self,
+                 gebaeudekategorie_sia,
+                 regelung,
+                 windows,
+                 walls,
+                 roof,
+                 floor,
+                 energy_reference_area,
+                 heat_recovery_nutzungsgrad,
+                 infiltration_volume_flow,
+                 ventilation_volume_flow,
+                 ventilation_volume_flow_increased,
+                 thermal_storage_capacity_per_floor_area,
+                 heat_pump_efficiency,
+                 combustion_efficiency_factor,
+                 electricity_decarbonization_factor,
+                 korrekturfaktor_luftungs_eff_f_v,
+                 height_above_sea,
+                 shading_factor_monthly,
+                 heizsystem,
+                 dhw_heizsystem,
+                 cooling_system,
+                 heat_emission_system,
+                 cold_emission_system,
+                 heating_setpoint="SIA",
+                 cooling_setpoint="SIA",
+                 area_per_person="SIA",
+                 has_mechanical_ventilation=False,
+                 set_back_reduction_factor=1,
+                 max_electrical_storage_capacity=0,
+                 district_heating_decarbonization_factor = 1):
+
+        self.gebaeudekategorie_sia = gebaeudekategorie_sia
+        self.regelung = regelung
+        self.windows = windows  # np.array of windows with |orientation|area|u-value|g-value|
+        self.walls = walls  # np.array of walls with |area|u-value| so far, b-values are not possible
+        self.roof = roof  # np.array of roofs with |area|u-value|
+        self.floor = floor  # np.array of floowrs with |area|u-value|b-value|
+        self.energy_reference_area = energy_reference_area  # One value, float
+        self.anlagennutzungsgrad_wrg = heat_recovery_nutzungsgrad  # One value, float
+        self.q_inf = infiltration_volume_flow
+        self.ventilation_volume_flow = ventilation_volume_flow
+        self.ventilation_volume_flow_increased = ventilation_volume_flow_increased
+        self.warmespeicherfahigkeit_pro_ebf = thermal_storage_capacity_per_floor_area # One value, float
+        self.korrekturfaktor_luftungs_eff_f_v = korrekturfaktor_luftungs_eff_f_v
+        self.hohe_uber_meer = height_above_sea
+        self.shading_factor_monthly = shading_factor_monthly #np.array of 12 factors
+        self.heating_setpoint= heating_setpoint
+        self.cooling_setpoint= cooling_setpoint
+        self.area_per_person= area_per_person
+        self.heating_system = heizsystem
+        self.cooling_system = cooling_system
+        self.dhw_heating_system = dhw_heizsystem
+        self.heat_emission_system = heat_emission_system
+        self.cold_emission_system = cold_emission_system
+        self.heating_supply_temperature = dp.lookup_supply_temperatures_according_to_rc(self.heat_emission_system)[0]
+        self.cooling_supply_temperature = dp.lookup_supply_temperatures_according_to_rc(self.cold_emission_system)[1]
+        self.heat_pump_efficiency = heat_pump_efficiency
+        self.combustion_efficiency_factor = combustion_efficiency_factor
+        self.electricity_decarbonization_factor = electricity_decarbonization_factor
+        self.has_mechanical_ventilation = has_mechanical_ventilation
+        self.battery_storage_capacity = max_electrical_storage_capacity
+        self.district_heating_decarbonization_factor = district_heating_decarbonization_factor
+
+        # Further optional attributes:
+        self.electricity_demand = None
+        self.electricity_mix = None
+        self.dhw_demand = None  # np.array of monthly values per energy reference area [kWh/(m2*month)]
+        self.pv_production = None  # This input is currently implemented as Wh (!)
+        self.nominal_heating_power = None
+        self.nominal_cooling_power = None
+        self.pv_peak_power = None  # in kW
+        self.annual_self_consumption = None
+
+        self.heating_set_back_reduction_factor = set_back_reduction_factor
+
+
+    def run_SIA_380_1(self, weather_data_sia):
+
+        ## Standardnutzungswerte
+
+        regelzuschlaege = dp.sia_standardnutzungsdaten('regelzuschaege')
+        warmeabgabe_p_p = dp.sia_standardnutzungsdaten('gain_per_person')
+        prasenzzeiten = dp.sia_standardnutzungsdaten('presence_time')
+        # this part of elektrizitatsbedarf only goes into thermal calculations. Electricity demand is calculated
+        # independently.
+        elektrizitatsbedarf = dp.sia_standardnutzungsdaten('gains_from_electrical_appliances')
+        reduktion_elektrizitat = dp.sia_standardnutzungsdaten('reduction_factor_for_electricity')
+
+        if self.ventilation_volume_flow == "SIA":
+            aussenluft_strome = dp.sia_standardnutzungsdaten('effective_air_flow')
+        else:
+            aussenluft_strome = {int(self.gebaeudekategorie_sia):self.ventilation_volume_flow+self.q_inf}
+
+        if self.heating_setpoint == "SIA":
+            standard_raumtemperaturen = dp.sia_standardnutzungsdaten('room_temperature_heating')
+        else:
+            standard_raumtemperaturen = {int(self.gebaeudekategorie_sia):self.heating_setpoint}
+
+        if self.area_per_person == "SIA":
+            personenflachen = dp.sia_standardnutzungsdaten('area_per_person')
+        else:
+            personenflachen = {int(self.gebaeudekategorie_sia):self.area_per_person}
+
+        
+        ## Klimadaten für verschiedene Ausrichtungen
+        mj_to_kwh_factor = 1.0/3.6
+        globalstrahlung_horizontal_monatlich = weather_data_sia['global_horizontal'] * mj_to_kwh_factor  # kWh/m2
+        globalstrahlung_ost_monatlich = weather_data_sia['global_east'] * mj_to_kwh_factor  # kWh/m2
+        globalstrahlung_sud_monatlich = weather_data_sia['global_south'] * mj_to_kwh_factor  # kWh/m2
+        globalstrahlung_west_monatlich = weather_data_sia['global_west'] * mj_to_kwh_factor  # kWh/m2
+        globalstrahlung_nord_monatlich = weather_data_sia['global_north'] * mj_to_kwh_factor # kWh/m2
+        temperatur_mittelwert = weather_data_sia['temperature']  # degC
+
+        t_c = [31,28,31,30,31,30,31,31,30,31,30,31]  # Tage pro Monat.
+
+        theta_i_001 = standard_raumtemperaturen[int(self.gebaeudekategorie_sia)] # Raumtemperatur in °C Gemäss SIA380-1 2016 Tab7 (grundsätzlich 20°C)
+        delta_phi_i_002 = regelzuschlaege[self.regelung] # Regelungszuschlag für die Raumtemperatur [K] gemäss SIA380-1 2016 Tab8
+        a_p_003 = personenflachen[int(self.gebaeudekategorie_sia)]  # Personenfläche m2/P
+        q_p_004 = warmeabgabe_p_p[int(self.gebaeudekategorie_sia)] # Wärmeabgabe pro Person W/P
+        t_p_005 = prasenzzeiten[int(self.gebaeudekategorie_sia)]  # Präsenzzeit pro Tag h/d
+        e_f_el_006 = elektrizitatsbedarf[int(self.gebaeudekategorie_sia)]  # Elektrizitätsbedarf pro Jahr kWh/m2
+        f_el_007 = reduktion_elektrizitat[int(self.gebaeudekategorie_sia)]  # Reduktionsfaktor Elektrizität [-]
+
+        eta_v_081 = self.anlagennutzungsgrad_wrg  # anlagennutzungsgrad der wärmerückgewinnung [-]
+        f_v_082 = self.korrekturfaktor_luftungs_eff_f_v  # Korrekturfaktor für die Lüftungseffektivität [-]
+
+        q_th_008 = ((aussenluft_strome[int(self.gebaeudekategorie_sia)]-self.q_inf)*(1-eta_v_081)/f_v_082) + self.q_inf
+        # thermisch wirksamer Aussenluftvolumenstrom gem 3.5.5 m3/(hm2)
+
+        h_010 = self.hohe_uber_meer  # Höhge über Meer [m]
+
+        transmissionsverluste = np.empty(12)
+        luftungsverluste = np.empty(12)
+        gesamtwarmeverluste = np.empty(12)
+        interne_eintrage = np.empty(12)
+        solare_eintrage = np.empty(12)
+        totale_warmeeintrage = np.empty(12)
+        genutzte_warmeeintrage = np.empty(12)
+        heizwarmebedarf = np.empty(12)
+
+        verluste_dach = np.empty(12)
+        verluste_wand = np.empty(12)
+        verluste_ground = np.empty(12)
+        verluste_fenster = np.empty(12)
+
+
+        ## Berechnung nach SIA380-1 Anhang D
+
+        for month in range(12):
+            t_c_009 = t_c[month]  # Länge Berechnungsschritt [d]
+            theta_e_011 = temperatur_mittelwert[month] # Aussenlufttemperatur [degC]
+            g_sh_012 = globalstrahlung_horizontal_monatlich[month]  # globale Sonnenstrahlung horizontal [kWh/m2]
+            g_ss_013 = globalstrahlung_sud_monatlich[month]  # hemisphärische Sonnenstrahlung Süd [kWh/m2]
+            g_se_014 = globalstrahlung_ost_monatlich[month]  # hemisphärische Sonnenstrahlung Ost [kWh/m2]
+            g_sw_015 = globalstrahlung_west_monatlich[month] # hemisphärische Sonnenstrahlung West [kWh/m2]
+            g_sn_016 = globalstrahlung_nord_monatlich[month]  # hemisphärische Sonnenstrahlung Nord [kWh/m2]
+
+            g_s_windows = window_irradiation(self.windows, g_sh_012, g_ss_013, g_se_014, g_sw_015, g_sn_016)
+
+            # Flächen, Längen und Anzahl
+            # Es gibt hier viele Nullen, die könnten später nützlich werden, falls der Code erweitert werden soll.
+            a_e_017 = self.energy_reference_area  # Energiebezugsfläche [m2]
+            a_re_018 = self.roof[0]  # Dach gegen Aussenluft [m2]
+            a_ru_019 = np.array([0])  # Decke gegen unbeheizte Räume [m2]
+            a_we_020 = self.walls[0]  # Wand gegen Aussenluft [m2]
+            a_wu_021 = np.array([0])  # Wand gegen unbeheizte Räume [m2]
+            a_wg_022 = np.array([0]) # Wand gegen Erdreich [m2]
+            a_wn_023 = np.array([0])  # Wand gegen benachbarten beheizten Raum im Bilanzperimeter [m2]
+            a_fe_024 = np.array([0])  # Boden gegen Aussenluft [m2]
+            a_fu_025 = self.floor[0]  # Boden gegen unbeheizte Räume [m2]
+            a_fg_026 = np.array([0])  # Boden gegen Erdreich mit Bauteilheizung [m2]
+            a_fu_027 = np.array([0])  # Boden gegen unbeheizte Räume mit Bauteilheizung[m2]
+            a_fn_028 = np.array([0])  # Boden gegen beheizte Räume mit Bauteilheizung im Bilanzperimeter [m2]
+            a_rn_029 = np.array([0])  # Decke gegen beheizte Räume mit Bauteilheizung im Bilanzparameter [m2]
+            a_wh_030 = np.array([0])  # Fenster horizontal [m2]
+
+            i_rw_035 = np.array([0.]) # Wärmebrücke Decke/Wand [m]
+            i_wf_036 = np.array([0.])  # Wärmebrücke Gebäudesockel [m]
+            i_b_037 = np.array([0.])  # Wärmebrücke Balkon [m]
+            i_w_038 = np.array([0.])  # Wärmebrücke Fensteranschlag  [m]
+            i_f_039 = np.array([0.])  # Wärmebrücke Boden/Keller-Innenwand [m]
+            z_040 = np.array([0.]) # Wärmebrücke Stützen, Träger, Konsolen [-]
+
+            ### Diverses / Thermische Angaben
+            u_re_041 = self.roof[1]  # Dach gegen Aussenluft [W/(m2K)]
+            u_ru_042 = np.array([0]) # Decke gegen unbeheizte Räume  [W/(m2K)]
+            b_ur_043 = np.array([0])  # Reduktionsfaktor Decke gegen unbeheizte Räume [-]
+            u_we_044 = self.walls[1]  # Wand gegen Aussenluft  [W/(m2K)]
+            u_wu_045 = np.array([0])  # Wand gegen unbeheizte Räume  [W/(m2K)]
+            b_uw_046 = np.array([0])  # Reduktionsfaktor Wand gegen unbeheizte Räume [-]
+            u_wg0_047 = np.array([0])  # Wand gegen Erdreich  [W/(m2K)]
+            b_gw_048 = np.array([0])  # Reduktionsfaktro Wand gegen Erdreich [-]
+            u_wn_049 = np.array([0])  # Wand gegen benachbarten konditionierten Raum im Bilanzperimeter [W/(m2K)]
+            theta_in_050 = np.array([0])  # korrigierte Raumtemperatur des benachbarten konditionierten Raumes [degC]
+            u_fe_051 = np.array([0])  # Boden gegen Aussenluft [W/(m2K)]
+            u_fu_052 = self.floor[1]  # Boden gegen unbeheizte Räume [W/(m2K)]
+            u_fu_053 = np.array([0])  # Boden gegen unbeheizte Räume mit Bauteilheizung [W/(m2K)]
+            b_uf_054 = self.floor[2]  # Reduktionsfaktor Boden gegen unbeheizte Räume [-]
+            u_fg0_055 = np.array([0])  # Boden gegen Erdreich mit Bauteilheizung [W/(m2K)]
+            b_gf_056 = np.array([0])  # Reduktionsfaktro Boden gegen Erdreich [-]
+            u_fn_057 = np.array([0])  # Boden gegen beheizte Räume mit Bauteilheizung [W/(m2K)]
+            u_rn_058 = np.array([0])  # Decke gegen beheizte Räume mit Bauteilheizung [W/(m2K)]
+            delta_theta_059 = 0.0  # Temperaturzuschlag für Bauteilheizung [K], dies anpassen nach Tab16 SIA380-1 3.5.4.5
+            u_wh_060 = np.array([0])  # Fenster horizontal [W/(m2K)]
+
+            psi_rw_065 = np.array([0])  # Wärmebrücke Decke/Wand [W/(mK)]
+            psi_wf_066 = np.array([0])  # Wärmebrücke Fensteranschlag [W/(mK)]
+            psi_b_067 = np.array([0])  # Wärmebrücke Balkon [W/(mK)]
+            psi_w_068 = np.array([0])  # Wärmebrücke Fensteranschlag [W/(mK)]
+            psi_f_069 = np.array([0])  # Wärmebrücken Boden/Keller-Innenwand [W/(mK)]
+            chi_070 = np.array([0])  # Wärmebrückeen Stützen, Träger, Konsolen [W/K]
+            g_071 = 0.6  # Gesamtenergiedurchlassgrad Fenster [-], anpassen: momentan gibt es nur einen g-Wert für alle Fenster
+            ## Dies muss insbesondere angeschaut werden, da die Fenster ansonsten pro Himmelsrichtung getrennt sind. Dies sollte
+            ## bei zusätzlicher Vektorisierung aufgehoben werden.
+            ## Gleiches gilt für die unten angegebenen Verschattungsfaktoren!
+            f_f_072 = 0.95# Abminderungsfaktor für Fensterrahmen [-] Ebenfalls im Hardcode bei cooling nach ISO52016-1
+            f_sh_073 = 1.0  # Verschattungsfaktor horizontal [-]
+            f_sh = self.shading_factor_monthly[month] # Verschattungsfaktor für bewegliche Sonnenblenden [-]
+
+            ### spezielle Eingabedaten
+            cr_ae_078 = self.warmespeicherfahigkeit_pro_ebf  # Wärmespeicherfähigkeit pro EBF [kWh/(m2K)]
+            a_0_079 = 1.0  # numerischer Parameter für Ausnutzungsgrad [-] wird immer als 1 angenommen SIA 380-1 3.5.6.2
+            tau_0_080 = 15.0  # Referenzzeitkonstante für Ausnutzungsgrad [h] wird immer als 15 angenommen SIA 380-1 3.5.6.2
+
+            theta_ic_083 = theta_i_001 + delta_phi_i_002
+
+
+            q_re_084 = np.sum((theta_ic_083-theta_e_011) * t_c_009 * a_re_018 * u_re_041 * 24 / (a_e_017*1000)) # Dach geg Aussenluft [kWh/m2]
+            verluste_dach[month]=q_re_084
+            q_ru_085 = np.sum((theta_ic_083-theta_e_011) * t_c_009 * a_ru_019 * u_ru_042 * b_ur_043 * 24 / (a_e_017*1000))  # Decke gegen unbeheizte Räume [kWh/m2]
+            q_we_086 = np.sum((theta_ic_083-theta_e_011) * t_c_009 * a_we_020 * u_we_044 * 24 / (a_e_017*1000))  # Wand gegen Aussenluft
+            verluste_wand[month] = q_we_086
+            q_wu_087 = np.sum((theta_ic_083-theta_e_011) * t_c_009 * a_wu_021 * u_wu_045 * b_uw_046 * 24 / (a_e_017*1000))  # Wand gegen unbeheizte Räume
+            q_wg_088 = np.sum((theta_ic_083-theta_e_011) * t_c_009 * a_wg_022 * u_wg0_047 * b_gw_048 * 24 / (a_e_017*1000))  # Wand gegen Erdreich
+            q_wn_089 = np.sum((theta_ic_083-theta_in_050) * t_c_009 * a_wn_023 * u_wn_049 * 24 / (a_e_017 * 1000))  # Wand gegen benachbarte Räume
+            q_fe_090 = np.sum((theta_ic_083-theta_e_011) * t_c_009 * a_fe_024 * u_fe_051 * 24 / (a_e_017 * 1000))  # Boden gegen Aussenluft
+            q_fu_091 = np.sum((theta_ic_083-theta_e_011) * t_c_009 * a_fu_025 * u_fu_052 * b_uf_054 * 24 / (a_e_017 * 1000))  # Boden gegen unbeheizte Räume
+            q_fg_092 = np.sum((theta_ic_083-theta_e_011 + delta_theta_059) * t_c_009 * a_fg_026 * u_fg0_055 * b_gf_056 * 24 / (a_e_017 * 1000))  # Boden gegen Erdreich mit Bauteilheizung
+            verluste_ground[month] = q_fg_092
+            q_fu_093 = np.sum((theta_ic_083-theta_e_011 + delta_theta_059) * t_c_009 * a_fu_027 * u_fu_053 * b_uf_054 * 24 / (a_e_017 * 1000))  # Boden gegen unbeheizte Räume mit Bauteilheizung
+            q_fn_094 = np.sum((theta_ic_083 - theta_in_050 + delta_theta_059) * t_c_009 * a_fn_028 * u_fn_057 * 24 / (a_e_017 * 1000))  # Boden gegen beheizte Räume mit Bauteilheizung
+            q_rn_095 = np.sum((theta_ic_083 - theta_in_050 + delta_theta_059) * t_c_009 * a_rn_029 * u_rn_058 * 24 / (a_e_017 * 1000))  # Decke gegen beheizte Räume mit Bauteilheizung
+            q_wh_096 = np.sum((theta_ic_083 - theta_e_011) * t_c_009 * a_wh_030 * u_wh_060 * 24 / (a_e_017 * 1000))  # Fenster horizontal
+
+
+            q_w_097_to_100 = np.sum((theta_ic_083 - theta_e_011) * t_c_009 * self.windows[1] * self.windows[2] * 24 / (a_e_017 * 1000))
+
+            # print("theta_ic", theta_ic_083 )
+            # print("theta_e", theta_e_011)
+            # print("hdd", (theta_ic_083 - theta_e_011-2) * t_c_009)
+            verluste_fenster[month] = q_w_097_to_100
+
+            q_lrw_101 = np.sum((theta_ic_083 - theta_e_011) * t_c_009 * i_rw_035 * psi_rw_065 * 24 / (a_e_017 * 1000))
+            q_lwf_102 = np.sum((theta_ic_083 - theta_e_011) * t_c_009 * i_wf_036 * psi_wf_066 * 24 / (a_e_017 * 1000))
+            q_ib_103 = np.sum((theta_ic_083 - theta_e_011) * t_c_009 * i_b_037 * psi_b_067 * 24 / (a_e_017 * 1000))
+            q_lw_104 = np.sum((theta_ic_083 - theta_e_011) * t_c_009 * i_w_038 * psi_w_068 *24 / (a_e_017 * 1000))
+            q_lf_105 = np.sum((theta_ic_083 - theta_e_011) * t_c_009 * i_f_039 * b_uf_054 * psi_f_069 * 24 /(a_e_017 * 1000))
+            q_p106 = np.sum((theta_ic_083 - theta_e_011) * t_c_009 * z_040 * chi_070 * 24 / (a_e_017 * 1000))
+
+            q_t_107_temporary = q_re_084 + q_ru_085 + q_we_086 + q_wu_087 + q_wg_088 + q_wn_089 + q_fe_090 + q_fu_091 + q_fg_092 + q_fu_093\
+                    + q_fn_094 + q_rn_095 + q_wh_096 + q_w_097_to_100 + q_lrw_101 + q_lwf_102 + q_ib_103\
+                    + q_lw_104 + q_lf_105 + q_p106  ## Tansmissionswärmeverluste
+
+            rhoa_ca_108 = (1220-0.14 * h_010)/3600
+
+            q_th_109 = q_th_008  # Hier müsste eine Schnittstelle zwischen Nachweis und Optimierung angepasst werden.
+
+            if (q_t_107_temporary + ((theta_ic_083 - theta_e_011) * q_th_008 * t_c_009 * rhoa_ca_108 * 24)/1000) <= 0:
+                q_t_107 = 0
+                # print("Keine Transmissionswärmeverluste q_t_107", month, temperatur_mittelwert[month])
+            else:
+                q_t_107 = q_t_107_temporary
+
+
+            if  q_t_107_temporary + (theta_ic_083-theta_e_011) * q_th_109 * t_c_009 * rhoa_ca_108 *24/1000 <= 0:
+                q_v_110 = 0
+                # print("Kein Lüftungswärmeverlust", month, temperatur_mittelwert[month])
+            else:
+                q_v_110 = (theta_ic_083-theta_e_011) * q_th_109 * t_c_009 * rhoa_ca_108 * 24 / 1000
+
+
+            q_tot_111 = (q_t_107 + q_v_110) * self.heating_set_back_reduction_factor
+            h_112 = np.sum(a_re_018*u_re_041) + np.sum(a_ru_019 * u_ru_042 * b_ur_043) + np.sum(a_we_020 * u_we_044) \
+                    + np.sum(a_wu_021 * u_wu_045 * b_uw_046) + np.sum(a_wg_022 * u_wg0_047 * b_gw_048) + np.sum(a_fe_024 * u_fe_051) \
+                    + np.sum(a_fu_025 * u_fu_052 * b_uf_054) + np.sum(a_fg_026 * u_fg0_055 * b_gf_056) + np.sum(a_fu_027 * u_fu_053 * b_uf_054)\
+                    + np.sum(a_fn_028 * u_fn_057) + np.sum(a_rn_029 * u_rn_058) + np.sum(a_wh_030 * u_wh_060) \
+                    + np.sum(self.windows[1]*self.windows[2]) + np.sum(i_rw_035 * psi_rw_065)\
+                    + np.sum(i_wf_036 * psi_wf_066) + np.sum(i_b_037 * psi_b_067) + np.sum(i_w_038 * psi_w_068)\
+                    + np.sum(i_f_039 * b_uf_054 * psi_f_069) + np.sum(z_040 * chi_070)\
+                    + np.sum(a_e_017 * rhoa_ca_108 * q_th_109)  # Diese Gleichung überprüfen lassen.
+
+
+            ### Wärmeeinträge
+            q_i_el_113 = e_f_el_006 * f_el_007 * t_c_009 / 365
+            q_l_p_114 = q_p_004 * t_p_005 * t_c_009/(a_p_003 * 1000)
+            q_i_115 = q_i_el_113 + q_l_p_114
+
+            q_s_121 = np.sum(g_s_windows * self.windows[1] * self.windows[3] * 0.9 * f_f_072 * f_sh_073 * f_sh / a_e_017)
+
+
+            q_g_122 = q_i_115 + q_s_121  # Interne Wärmegewinne
+
+            # print("q_tot", q_tot_111)
+
+            if q_tot_111 == 0:  # This is not part of SIA380 but needs to be specified for months with no heating demand
+                gamma_123 = None
+            else:
+                gamma_123 = q_g_122/q_tot_111
+
+            tau_124 = cr_ae_078 * a_e_017 * 1000/h_112
+            #print('cr_ae_078', cr_ae_078)
+            a_125 = a_0_079 + (tau_124/tau_0_080)
+            #print('tau_124', tau_124)
+
+            # print(q_g_122)
+
+            if gamma_123 == None:
+                eta_g_126 = 0  # This is not part of SIA380-1 but needs to be specified for months with no heating demand
+
+            elif gamma_123 == 1:
+                eta_g_126 = a_125/(a_125+1)
+            else:
+                eta_g_126 = (1-gamma_123**a_125)/(1-gamma_123**(a_125 + 1))  # Hier weicht die Formel unter 3.5.6.2 von der Zusammenstellung im Anhang D ab
+            #print("gamma", gamma_123)
+            #print('a_125', a_125)
+
+
+            q_ug_127 = q_g_122 * eta_g_126
+            # f_ug_128 = q_ug_127 / q_tot_111
+
+            # print("gamma", gamma_123)
+            # print("eta", eta_g_126)
+            # print("q_ug", q_ug_127)
+
+            ### Heizwärmebedarf:
+            q_h_129 = q_tot_111 - q_ug_127
+
+            if theta_e_011 >= 12.0:
+                q_h_129 = 0
+
+
+            transmissionsverluste[month] = q_t_107
+            luftungsverluste[month] = q_v_110
+            gesamtwarmeverluste[month] = q_tot_111
+            interne_eintrage[month] = q_i_115
+            solare_eintrage[month] = q_s_121
+            totale_warmeeintrage[month] = q_g_122
+            genutzte_warmeeintrage[month] = q_ug_127
+            heizwarmebedarf[month] = q_h_129
+
+        # print("Solare Eintrage", solare_eintrage)
+        # print("genutzte_warmeeintrage", genutzte_warmeeintrage.sum())
+        # print("heizwärmebedarf", heizwarmebedarf.sum())
+        # print("transmissions_verluste", transmissionsverluste.sum())
+        # print("ventilation_verluste", luftungsverluste.sum())
+        # print("temperatur_mittelwert", temperatur_mittelwert)
+        # vereinfachte Normheizlast mit Angaben aus SIA 380-1 gemäss SIA 384.201
+        #
+        # print("Dach", verluste_dach)
+        # print("Ground", verluste_ground)
+        # print("Wand", verluste_wand)
+        # print("fenster", verluste_fenster)
+
+
+        self.totaler_warmetransferkoeffizient = h_112
+
+
+        self.transmissionsverluste = transmissionsverluste
+        self.luftungsverlust=luftungsverluste
+        self.gesamtwarmeverluste = gesamtwarmeverluste
+        self.interne_eintrage = interne_eintrage
+        self.solare_eintrage = solare_eintrage
+        self.totale_warmeeintrage = totale_warmeeintrage
+        self.genutzte_warmeeintrage = genutzte_warmeeintrage
+
+        if self.heating_system == 'None' or None:
+            self.heizwarmebedarf = np.repeat(0.0, 12)
+        else:
+            self.heizwarmebedarf = heizwarmebedarf
+
+    def run_ISO_52016_monthly(self, weather_data_sia, cooling_setpoint=None):
+
+        """
+        This function calculates monthly cooling energy demand per energy reference area in kWh/m2a. The output of
+        this function is positive for cooling demand.
+        """
+        if cooling_setpoint != None:
+            print("You use cooling setpoint as an input into ISO instead of the object definition. This version does no longer work.")
+            quit()
+        else:
+            pass
+
+        # cooling_temperature = dp.sia_standardnutzungsdaten('room_temperature_cooling')
+        warmeabgabe_p_p = dp.sia_standardnutzungsdaten('gain_per_person')
+        prasenzzeiten = dp.sia_standardnutzungsdaten('presence_time')
+        # this part of elektrizitatsbedarf only goes into thermal calculations. Electricity demand is calculated
+        # independently.
+        elektrizitatsbedarf = dp.sia_standardnutzungsdaten('gains_from_electrical_appliances')
+        reduktion_elektrizitat = dp.sia_standardnutzungsdaten('reduction_factor_for_electricity')
+        # aussenluft_strome = {1: 2.1}  # UBA-Vergleichsstudie
+
+        if self.cooling_setpoint == "SIA":
+            cooling_temperature = dp.sia_standardnutzungsdaten('room_temperature_cooling')
+        else:
+            cooling_temperature = self.cooling_setpoint
+
+        if self.ventilation_volume_flow == "SIA":
+            aussenluft_strome = dp.sia_standardnutzungsdaten('effective_air_flow')
+        else:
+            aussenluft_strome = {int(self.gebaeudekategorie_sia):self.ventilation_volume_flow+self.q_inf}
+
+        if self.ventilation_volume_flow_increased == "SIA":
+            aussenluft_strome_increased = dp.sia_standardnutzungsdaten('effective_air_flow')
+        else:
+            aussenluft_strome_increased = {int(self.gebaeudekategorie_sia):self.ventilation_volume_flow_increased+self.q_inf}
+
+        if self.area_per_person == "SIA":
+            personenflachen = dp.sia_standardnutzungsdaten('area_per_person')
+        else:
+            personenflachen = {int(self.gebaeudekategorie_sia):self.area_per_person}
+
+
+        # Dauer des Monats in Stunden
+        delta_t_m = np.array([31,28,31,30,31,30,31,31,30,31,30,31])*24.0
+
+
+        # 6.6.7.2 interne Wärmegewinne für die Zone in [kWh]
+        # Diese werden hier der Konsistenz wegen wie in SIA 380/1 berechnet
+        q_elektrische_anlagen = elektrizitatsbedarf[int(self.gebaeudekategorie_sia)] * self.energy_reference_area * \
+                                reduktion_elektrizitat[int(self.gebaeudekategorie_sia)] * delta_t_m / 8760
+
+        q_personen = warmeabgabe_p_p[int(self.gebaeudekategorie_sia)] / 1000.0 * \
+                     prasenzzeiten[int(self.gebaeudekategorie_sia)] * (delta_t_m / 24.0) / \
+                     (personenflachen[int(self.gebaeudekategorie_sia)]) * self.energy_reference_area
+
+        q_hc_int_dir_ztc_m = q_elektrische_anlagen + q_personen
+
+        # 6.6.7 Summe interner Wärmegewinne: Hier gilt folgende Gleichung, weil ich nur von einer
+        # Zone ausgehe:
+        q_c_int_ztc_m = q_hc_int_dir_ztc_m
+
+        # Solare Wärmegewinne durch Fenster: Hier greife ich auf die Implementierung gemäss SIA 380/1 zurück
+        # damit es konsistent mit dem heating demand ist.
+
+        mj_to_kwh_factor = 1.0 / 3.6
+        globalstrahlung_horizontal_monatlich = weather_data_sia['global_horizontal'] * mj_to_kwh_factor  # kWh/m2
+        globalstrahlung_ost_monatlich = weather_data_sia['global_east'] * mj_to_kwh_factor  # kWh/m2
+        globalstrahlung_sud_monatlich = weather_data_sia['global_south'] * mj_to_kwh_factor  # kWh/m2
+        globalstrahlung_west_monatlich = weather_data_sia['global_west'] * mj_to_kwh_factor  # kWh/m2
+        globalstrahlung_nord_monatlich = weather_data_sia['global_north'] * mj_to_kwh_factor  # kWh/m2
+
+        q_hc_sol_wi = np.empty(12)
+        f_glass_rahmen = 0.95  # zu verwendender Wert gemäss SIA 380/1
+        for month in range(12):
+            g_sh_012 = globalstrahlung_horizontal_monatlich[month]  # globale Sonnenstrahlung horizontal [kWh/m2]
+            g_ss_013 = globalstrahlung_sud_monatlich[month]  # hemisphärische Sonnenstrahlung Süd [kWh/m2]
+            g_se_014 = globalstrahlung_ost_monatlich[month]  # hemisphärische Sonnenstrahlung Ost [kWh/m2]
+            g_sw_015 = globalstrahlung_west_monatlich[month]  # hemisphärische Sonnenstrahlung West [kWh/m2]
+            g_sn_016 = globalstrahlung_nord_monatlich[month]  # hemisphärische Sonnenstrahlung Nord [kWh/m2]
+
+            g_s_windows = window_irradiation(self.windows, g_sh_012, g_ss_013, g_se_014, g_sw_015, g_sn_016)
+
+            q_hc_sol_wi[month] = np.sum(g_s_windows * self.windows[1] * self.windows[3] * 0.9 *
+                                        f_glass_rahmen * self.shading_factor_monthly[month])
+
+        # Solare Wärmegewinne durch opake Wände:
+        # !!!!! ACHTUNG anschauen, ob dies nicht noch implementiert werden sollte. Vielleicht beim cooling
+        # noch wichtig. Vorerst scheint es nicht nötig zu sein.
+        q_hc_sol_op = np.repeat(0.0, 12)
+
+        # 6.6.8 Summe der solaren Wärmegewinne für die Kühlung
+        q_c_sol_ztc_m = q_hc_sol_wi + q_hc_sol_op
+
+        # Addition interner und solarer Gewinne 6.6.4.4
+        q_c_gn_ztc_m = q_c_int_ztc_m + q_c_sol_ztc_m
+
+
+        # Gesamtwärmeübergangskoeffizient für Elemente, die mit der äusseren Umgebung verbunden sind. Dieser Wert wird
+        # zeitlich konstant angenommen. [W/K]
+        h_hc_el = np.sum(self.roof[0] * self.roof[1]) + np.sum(self.walls[0] * self.walls[1]) +\
+        np.sum(self.windows[1] * self.windows[2])
+
+        # Gesamtwärmeübergangskoeffizient für Wärmebrücken in der thermisch konditionierten Zone (6.6.5.3)[W/K]
+        # Für den Moment nehme ich an, dass es keine Wärmebrücken gibt
+        h_tr_tb_ztc = 0.0
+
+        # 6.6.5.2 Gesamtwärmeübergangskoeffizient durch Transmission für die Kühlung für alle Gebäudeelemente
+        # ausser mit dem Erdreich verbunden in [W/K]
+        h_c_tr_excl_gf_m_ztc_m = h_hc_el + h_tr_tb_ztc
+
+        # 6.6.11 Berechnungstemperatur der Zone für die Kühlung in [degC]
+        theta_int_calc_c_ztc_m = cooling_temperature
+
+        # mittlere monatliche Temperaturen der Aussenluft gemäss relevanten Normen [degC]
+        theta_e_a_m = np.array(weather_data_sia['temperature'])
+
+        # ISO 13789 Wärmeübergangskoeffizient des Erdreichs in [W/K] (evtl auch aus SIA380?)
+        # Für den Moment so wie bei SIA380/1 gelöst. Noch genauer anschauen, ob dies so gemeint ist.
+        h_gr_an_ztc_m =np.sum(self.floor[2] * self.floor[1] * self.floor[0])
+
+        # mittlere Jahresaussentemperatur in [decC] gemäss relevanten Normen
+        theta_e_a_an = theta_e_a_m.mean()
+
+
+
+        # 6.6.5 Gesamtwärmeübertragung durch Transmission für die Kühlung
+        q_c_tr_ztc_m = (h_c_tr_excl_gf_m_ztc_m * (theta_int_calc_c_ztc_m - theta_e_a_m) + h_gr_an_ztc_m *(theta_int_calc_c_ztc_m - theta_e_a_an)) * 0.001 * delta_t_m
+        # -> array mit 12 Positionen
+
+        # 6.3.6 in [J/m3K] Aus Konsistenzgründen habe ich hier vorerst die Berechnungsvariante gemäss SIA380
+        # verwendet. Überprüfen
+        rho_a_c_a = (1220 - 0.14 * self.hohe_uber_meer)
+
+        # 6.6.6.2 Dieser Faktor ist gleich 1 unter der Annahme, dass mit Aussenlufttemperatur gelüftet wird
+        # TODO: Überprüfen, inwiefern dies mit SIA380 kompatibel ist bzw. WRG/KRG möglich wäre.
+        b_ve_c_m = 1
+
+        # 6.6.6.2 gemittelter Luftvolumenstrom in [m3/s] nach relevanten Normen
+        # das Objekt hat aussenluft strome in m3 pro stunde und EBF angegeben, deshalb hier die Korrekturen
+        q_v_hc_m = np.repeat(aussenluft_strome[int(self.gebaeudekategorie_sia)] * self.energy_reference_area /3600., 12)
+        q_v_hc_increased = aussenluft_strome_increased[int(self.gebaeudekategorie_sia)] *self.energy_reference_area/3600.
+        q_v_hc_m[np.where((q_c_gn_ztc_m - q_c_tr_ztc_m) > 0)]=q_v_hc_increased
+        # np.array
+
+        # 6.6.6.2 Dieser Wert kann als 1.0 angenommen werden, sofern nicht anders definiert
+        # Diese Annahme überprüfen. In Tabelle A.28 und B.28
+        f_ve_dyn_m = 1.0
+
+
+        # 6.6.6.2 Gesamtwärmeübergangskoeffizient durch Lüftung für Heizung/Kühlung [W/K]
+        # Ich gehe nur von einer Lüftung aus, deshalb fehlen die indices k
+        h_hc_ve_ztc_m = rho_a_c_a * b_ve_c_m * q_v_hc_m * f_ve_dyn_m
+
+        # 6.6.6.1 Gesamtwärmeübertragung durch Lüftung für die Kühlung. Es scheint, dass in Gleichung (113) q statt
+        # theta steht
+        ## Hier evtl Fehler in Norm. Meiner Meinung nach, muss hier durch 1000 dividiert werden um kWh zu erhalten.
+        q_c_ve_ztc_m = h_hc_ve_ztc_m * (theta_int_calc_c_ztc_m - theta_e_a_m) * delta_t_m /1000.0
+
+        #Allenfalls wie bei Heizwärme nach SIA sieh unten:
+        #q_th_008 = ((aussenluft_strome[int(self.gebaeudekategorie_sia)]-self.q_inf)*(1-eta_v_081)/f_v_082) + self.q_inf
+
+        # Addition von transmissions und Lüftungsverluste 6.6.4.4
+        q_c_ht_ztc_m = q_c_tr_ztc_m + q_c_ve_ztc_m
+
+
+        # 6.6.9 die effektive interne Wärmekapiztät in J/K Tab 21
+        ## self. warmespeicherfahigkeit_pro_ebf ist aber in kWh/m2K (compatible with SIA380-1)
+        c_m_eff_ztc = self.warmespeicherfahigkeit_pro_ebf * self.energy_reference_area
+
+
+        # !!!! Achtung, dies ist nicht bestätigt!!!! Muss mit ISO13789 oder SIA380 angepasst weren
+        h_c_gr_adj_ztc = 0.0
+
+        # 6.6.10.4 Zeitkonstante: Factor of 1000 because c_m_eff_ztc comes in kWh/K while h is in W/K
+        tau_c_ztc_m = c_m_eff_ztc * 1000 / (h_c_tr_excl_gf_m_ztc_m + h_c_gr_adj_ztc + h_hc_ve_ztc_m)
+        # Tabelle B.35 (informative Standardwerte) ebenfalls so in SIA380-1 zu finden
+        tau_c_0 = 15. # h
+        a_c_0 =1.0 # no dimension
+
+        # 6.6.10.3, page 137
+        a_c_ztc_m = a_c_0 + tau_c_ztc_m/tau_c_0
+
+        # 6.6.11.4 This value is assumed. Should be changed for intermittent cooling.
+        a_c_red_ztc_m = 1.0
+
+        # 6.6.10.2
+        eta_c_ht_ztc_m = np.empty(12)
+
+        #  Verhältnis von Wärmegewinnen zu Wärmeverlusten
+        gamma_c_ztc_m = q_c_gn_ztc_m / q_c_ht_ztc_m
+
+        for month in range(12):
+            if gamma_c_ztc_m[month] == 1.0:
+                eta_c_ht_ztc_m[month] = (a_c_ztc_m)/(a_c_ztc_m[month]+1)
+
+            elif gamma_c_ztc_m[month] <= 0:
+                eta_c_ht_ztc_m[month] = 1.0
+
+            else:
+                eta_c_ht_ztc_m[month] = (1-(gamma_c_ztc_m[month])**-a_c_ztc_m[month])/(1-(gamma_c_ztc_m[month])**-(a_c_ztc_m[month]+1))
+
+        # Monthly cooling demand summation
+        q_c_nd_ztc_m = np.empty(12)
+        for month in range(12):
+            if 1.0/gamma_c_ztc_m[month] >2.0:
+                q_c_nd_ztc_m[month] = 0
+
+            else:
+                q_c_nd_ztc_m[month] = a_c_red_ztc_m * (q_c_gn_ztc_m[month] - eta_c_ht_ztc_m[month] * q_c_ht_ztc_m[month])
+
+        # for month in range(12): ### This is a test
+        #     if theta_e_a_m[month]<=20.0: ### This is a test
+        #         q_c_nd_ztc_m[month] = 0 ### This is a test
+        #     else:
+        #         pass
+
+        self.iso_transmission_losses = q_c_tr_ztc_m/self.energy_reference_area
+        self.iso_solar_gains = q_hc_sol_wi/self.energy_reference_area
+        self.iso_internal_gains =  q_hc_int_dir_ztc_m / self.energy_reference_area
+
+
+        if self.cooling_system == 'None' or None:
+            self.monthly_cooling_demand = np.repeat(0.0, 12)
+        else:
+            self.monthly_cooling_demand = q_c_nd_ztc_m/self.energy_reference_area
+
+    def run_dhw_demand(self):
+        """
+        Add dhw demand to the building. Retract data from Data prep file
+        :return:
+        """
+        ## Werte aus Datenbanken auslesen:
+        self.dhw_demand = np.repeat(dp.sia_annaul_dhw_demand(self.gebaeudekategorie_sia) / 12.0, 12)
+
+        if self.dhw_heating_system == 'None' or None:
+            self.dhw_demand = np.repeat(0.0,12)
+        else:
+            pass
+
+
+    def run_SIA_380_emissions(self, emission_factor_source, emission_factor_source_UBP, emission_factor_type, weather_data_sia,
+                              energy_cost_source, country):
+        """
+        Beachte: Die SIA Norm kennt keinen flexiblen Strommix. Soll das Stromprodukt ausgewählt werden können,
+        müssten hiere noch weitere Anpassungen durchgeführt werden.
+
+        - Man beachte, dass die Berechnungen in der SIA 380-1 normiert auf die Energiebezugsfläche sind. Die PV
+        Produktion wird innerhalb dieser Funktion entsprechend normalisiert. Ebenfalls kommt der PV input in Wh und
+        muss noch durch 1000 dividiert werden.
+        :return:
+        """
+        if not hasattr(self, 'heizwarmebedarf'):
+            print("Before you can calculate the emissions, you first have to run the heating demand simulation")
+            quit()
+
+        # self.pv_production is total PV production in Wh and has to be normalized and divided by 1000 for the SIA
+        # framework because it comes in Wh
+        if self.pv_production != None: #Only calc Monthly PV production, if hourly PV is calculated 
+            pv_prod_month = dp.hourly_to_monthly(self.pv_production)/self.energy_reference_area/1000.0
+        else:
+            pv_prod_month = np.repeat(0.0, 12)
+
+        ### Bestimmung Elektrizitätsbedarf pro EBF:
+        self.electricity_demand = self.app_light_other_electricity_monthly_demand
+        # TODO: ADD electricity demand for ventilation here! Only here!!!
+        if self.heating_system == "GSHP":
+            gshp_cop_heating, gshp_cop_cooling = dp.calculate_monthly_gshp_cop(self.heating_supply_temperature,
+                                                                               self.cooling_supply_temperature,
+                                                                               12.0, self.heat_pump_efficiency)
+            self.heating_elec = self.heizwarmebedarf/gshp_cop_heating
+        elif self.heating_system == "ASHP":
+            ashp_cop_heating, ashp_cop_cooling = dp.calculate_monthly_ashp_cop(self.heating_supply_temperature,
+                                                                               self.cooling_supply_temperature,
+                                                                               weather_data_sia,
+                                                                               self.heat_pump_efficiency)
+            self.heating_elec = self.heizwarmebedarf/ashp_cop_heating
+
+        elif self.heating_system == "electric":
+            self.heating_elec = self.heizwarmebedarf
+
+        else:
+            self.heating_elec = np.repeat(0.0, 12)
+
+        # same for dhw
+
+        if self.dhw_heating_system == "GSHP":
+            # temp in hardcode should be ok
+            gshp_cop_dhw, gshp_cop_cooling = dp.calculate_monthly_gshp_cop(60.0, self.cooling_supply_temperature,
+                                                                               12.0, self.heat_pump_efficiency)
+            self.dhw_elec = self.dhw_demand/gshp_cop_dhw
+
+        elif self.dhw_heating_system == "ASHP":
+            ashp_cop_dhw, ashp_cop_cooling = dp.calculate_monthly_ashp_cop(60.0, self.cooling_supply_temperature,
+                                                                           weather_data_sia, self.heat_pump_efficiency)
+            self.dhw_elec = self.dhw_demand / ashp_cop_dhw
+
+        elif self.dhw_heating_system == "electric":
+            self.dhw_elec = self.dhw_demand
+
+        else:
+            self.dhw_elec = 0.0
+
+        # same for cooling
+        if self.cooling_system == "GSHP":
+            gshp_cop_heating, gshp_cop_cooling = dp.calculate_monthly_gshp_cop(self.heating_supply_temperature,
+                                                                               self.cooling_supply_temperature,
+                                                                               12.0, self.heat_pump_efficiency)
+            self.cooling_elec = self.monthly_cooling_demand/gshp_cop_cooling
+
+        elif self.cooling_system == "ASHP":
+            ashp_cop_heating, ashp_cop_cooling = dp.calculate_monthly_ashp_cop(self.heating_supply_temperature,
+                                                                               self.cooling_supply_temperature,
+                                                                               weather_data_sia,
+                                                                               self.heat_pump_efficiency)
+            self.cooling_elec = self.monthly_cooling_demand/ashp_cop_cooling
+
+        elif self.cooling_system == "split unit":
+            split_unit_cop_cooling = dp.calculate_monthly_split_unit_cop()
+            self.cooling_elec = self.monthly_cooling_demand/split_unit_cop_cooling
+
+        elif self.cooling_system == "electric":
+            print("Pure electric cooling is not a possible choice, simulation terminated")
+            quit()
+
+        else:
+            self.cooling_elec = 0.0
+
+        self.electricity_demand += (self.heating_elec + self.dhw_elec + self.cooling_elec)
+        # TODO: At one point it might be useful to store these monthly values into a spreadsheet.
+        # For now they are only printed for a quick reliability check of the results.
+        #print("total electricity demand:", self.electricity_demand)
+        #print("heating electricty demand", self.heating_elec)
+        #print("dhw electricity demand:", self.dhw_elec)
+        #print("cooling electricity demand", self.cooling_elec)
+
+        electricity_demand_for_self_consumption = self.electricity_demand * self.energy_reference_area
+
+          
+        if self.pv_production != None: #Only include PV and Battery calculation if PV is installed 
+            # Divide by 100 because result comes in percentage
+            sc_factors = dp.estimate_self_consumption(electricity_demand_for_self_consumption, self.pv_peak_power,
+                                                  self.gebaeudekategorie_sia, self.battery_storage_capacity)/100
+
+            # Achtung, hier kann net demand auch kleiner 0 sein;  pv_prod_month ist ebenfalls normalisiert bezüglich EBF
+            self.net_electricity_demand = self.electricity_demand - (sc_factors * pv_prod_month)
+        else:
+            self.net_electricity_demand = self.electricity_demand
+
+        if pv_prod_month.sum() > 0:
+            self.annual_self_consumption = (self.electricity_demand-self.net_electricity_demand).sum()/pv_prod_month.sum()
+        else:
+            self.annual_self_consumption = 0
+
+        ## Calculate operational impact:
+        self.fossil_heating_emissions = np.empty(12)
+        self.fossil_heating_emissions_UBP = np.empty(12)
+        self.fossil_dhw_emissions = np.empty(12)
+        self.fossil_dhw_emissions_UBP = np.empty(12)
+        self.electricity_emissions = np.empty(12)
+        self.electricity_emissions_UBP = np.empty(12)
+        self.fossil_heating_energy_costs = np.empty(12)
+        self.fossil_dhw_energy_costs = np.empty(12)
+        self.electricity_energy_costs = np.empty(12)
+
+
+        # account for fossil heating emissions in GWP and UBP
+        if self.heating_system in ["Oil", "Natural Gas", "Wood", "Pellets", "district"]:
+            #Introduce decarbonization of distric heating grid
+            if self.heating_system =="district":
+                decarbonization_factor = self.district_heating_decarbonization_factor
+            else: 
+                decarbonization_factor = 1
+            
+            self.fossil_heating_emissions = \
+                self.heizwarmebedarf * dp.fossil_emission_factors(self.heating_system, emission_factor_source, self.combustion_efficiency_factor).mean() * decarbonization_factor
+            
+            self.fossil_heating_emissions_UBP = \
+                self.heizwarmebedarf * dp.fossil_emission_factors_UBP(self.heating_system, emission_factor_source_UBP, self.combustion_efficiency_factor).mean() * decarbonization_factor
+        else:
+            self.fossil_heating_emissions = 0.0
+            self.fossil_heating_emissions_UBP = 0.0
+
+        ## Add the same for cooling if district cooling should be possible.
+
+        # account for fossil dhw emissions in GWP and UBP
+        if self.dhw_heating_system in ["Oil", "Natural Gas", "Wood", "Pellets", "district"]:
+            #Introduce decarbonization of distric heating grid
+            if self.dhw_heating_system =="district":
+                decarbonization_factor = self.district_heating_decarbonization_factor
+            else: 
+                decarbonization_factor = 1
+                
+            self.fossil_dhw_emissions = \
+                self.dhw_demand * dp.fossil_emission_factors(self.dhw_heating_system, emission_factor_source, self.combustion_efficiency_factor).mean() * decarbonization_factor
+            
+            self.fossil_dhw_emissions_UBP = \
+                self.dhw_demand * dp.fossil_emission_factors_UBP(self.dhw_heating_system, emission_factor_source_UBP, self.combustion_efficiency_factor).mean() * decarbonization_factor
+        else:
+            self.fossil_dhw_emissions = 0.0
+            self.fossil_dhw_emissions_UBP = 0.0
+
+        # account for net grid import emissions in GWP and UBP
+        self.grid_electricity_emissions = self.net_electricity_demand * dp.build_country_yearly_emission_factors(country=country).mean() * self.electricity_decarbonization_factor
+        self.grid_electricity_emissions[self.grid_electricity_emissions < 0.0] = 0.0
+        
+        self.grid_electricity_emissions_UBP = self.net_electricity_demand * dp.build_yearly_emission_factors_UBP(
+            emission_factor_source_UBP, emission_factor_type).mean()
+        self.grid_electricity_emissions_UBP[self.grid_electricity_emissions_UBP < 0.0] = 0.0
+
+        self.operational_emissions = self.fossil_heating_emissions + self.fossil_dhw_emissions + \
+                                     self.grid_electricity_emissions ## always make sure to be clear what these emissions include (see SIA 380)
+        self.operational_emissions_UBP = self.fossil_heating_emissions_UBP + self.fossil_dhw_emissions_UBP + \
+                                     self.grid_electricity_emissions_UBP ## always make sure to be clear what these emissions include (see SIA 380)
+        #print(self.fossil_heating_emissions)
+        ### calculate operational emissions
+        # fossil fuel costs
+        if self.heating_system in ["Oil", "Natural Gas", "Wood", "Pellets", "district"]:
+            self.fossil_heating_energy_costs = \
+                self.heizwarmebedarf * dp.energy_cost_per_kWh(self.heating_system, energy_cost_source, self.combustion_efficiency_factor)
+        else:
+            self.fossil_heating_energy_costs = 0.0
+
+        if self.dhw_heating_system in ["Oil", "Natural Gas", "Wood", "Pellets", "district"]:
+            self.fossil_dhw_energy_costs = \
+                self.dhw_demand * dp.energy_cost_per_kWh(self.dhw_heating_system, energy_cost_source, self.combustion_efficiency_factor)
+        else:
+            self.fossil_dhw_energy_costs = 0.0
+
+        # electricity costs
+        self.electricity_energy_costs = self.net_electricity_demand * dp.energy_cost_per_kWh("electricity", energy_cost_source)
+        self.electricity_energy_costs[self.electricity_energy_costs < 0.0] = 0.0
+
+        # total energy costs
+        self.energy_costs = self.fossil_heating_energy_costs + self.fossil_dhw_energy_costs + self.electricity_energy_costs
+
+    
+
+    def run_SIA_electricity_demand(self, occupancy_data): #Detailed Version on monthly schedules: Question reasonable? Since better energy efficency. 
+        self.app_light_other_electricity_monthly_demand = dp.hourly_to_monthly(
+            dp.sia_electricity_per_erf_hourly(occupancy_data, self.gebaeudekategorie_sia,
+                                              self.has_mechanical_ventilation))
+        
+   
+    def run_SIA_electricity_demand_simplifed(self): # Ele Demand Simplified: only MFH according table 12 in SIA 380/1 and, Retruns ele demand per m2 EBF and month
+        
+        ele_vent = 0.8 if self.has_mechanical_ventilation else 0 
+        per_month = (28 + ele_vent)/12 
+        self.app_light_other_electricity_monthly_demand = np.full(12, per_month)
+        
+
+
+
+    def run_heating_sizing_384_201(self, weatherfile_path):
+
+        epw_labels = ['year', 'month', 'day', 'hour', 'minute', 'datasource', 'drybulb_C', 'dewpoint_C',
+                      'relhum_percent',
+                      'atmos_Pa', 'exthorrad_Whm2', 'extdirrad_Whm2', 'horirsky_Whm2', 'glohorrad_Whm2',
+                      'dirnorrad_Whm2', 'difhorrad_Whm2', 'glohorillum_lux', 'dirnorillum_lux', 'difhorillum_lux',
+                      'zenlum_lux', 'winddir_deg', 'windspd_ms', 'totskycvr_tenths', 'opaqskycvr_tenths',
+                      'visibility_km',
+                      'ceiling_hgt_m', 'presweathobs', 'presweathcodes', 'precip_wtr_mm', 'aerosol_opt_thousandths',
+                      'snowdepth_cm', 'days_last_snow', 'Albedo', 'liq_precip_depth_mm', 'liq_precip_rate_Hour']
+
+        weather_data = pd.read_csv(weatherfile_path, skiprows=8, header=None, names=epw_labels).drop('datasource',
+                                                                                                     axis=1)
+        min_temp = weather_data['drybulb_C'].min()
+        standard_temperature = dp.sia_standardnutzungsdaten('room_temperature_heating')[int(self.gebaeudekategorie_sia)]
+        # Nach SIA müsste hier der Mittelwert der kältesten 4 Tagesperiode der letzten 20 Jahren gewählt werden. Dies
+        # ist allerdings kaum möglich mit einem Wetterfile. Ich wähle deshalb die stündlich tiefste Temperatur eines
+        # typischen Jahres.
+        self.nominal_heating_power = self.totaler_warmetransferkoeffizient * (standard_temperature - min_temp)  # in W
+
+
+    def run_cooling_sizing(self):
+        if self.cooling_system == "None" or None:
+            self.nominal_cooling_power = 0.0
+        else:
+            #self.nominal_cooling_power = self.monthly_cooling_demand.sum()*self.energy_reference_area*1000/550
+            self.nominal_cooling_power = self.energy_reference_area * 10  # in W TODO: remove hard coded value from SIA2024
+
+
+def window_irradiation(windows, g_sh_012, g_ss_013, g_se_014, g_sw_015, g_sn_016):
+    """
+    Diese Funktion rechnet die ausrichtungsspezifischen Einstrahlungswerte aus und bereitet den Einstrahlungsvektor
+    für die Berechnung der run Funktion vor.
+    [Horizontale Ausrichtung noch nicht möglich]
+    :param windows: np.array [[Orientation],[Areas],[U-values],[g-values]]
+    :param g_sh_012: float monthly horizontal irradiation
+    :param g_ss_013: float monthly south irradiation
+    :param g_se_014: float monthly east irradiation
+    :param g_sw_015: float monthly west irradiation
+    :param g_sn_016: float monthly north irradiation
+    :return:
+    """
+
+    g_s_windows = np.empty(len(windows[0]))
+
+    for i in range(len(windows[0])):
+        if windows[0][i] == "S":
+            g_s_windows[i] = g_ss_013
+        elif windows[0][i] == "E":
+            g_s_windows[i] = g_se_014
+        elif windows[0][i] == "W":
+            g_s_windows[i] = g_sw_015
+        elif windows[0][i] == "N":
+            g_s_windows[i] = g_sn_016
+        elif windows[0][i] == "SE":
+            g_s_windows[i] = (g_ss_013*g_se_014)**0.5
+        elif windows[0][i] == "SW":
+            g_s_windows[i] = (g_ss_013*g_sw_015)**0.5
+        elif windows[0][i] == "NW":
+            g_s_windows[i] = (g_sn_016*g_sw_015)**0.5
+        elif windows[0][i] == "NE":
+            g_s_windows[i] = (g_sn_016*g_se_014)**0.5
+        else:
+            "Himmelsrichtungen bei den Fenstern nicht korrekt eingegeben. Bitte beachte, dass vorerst nur ein oder " \
+            "zweistellige Richtungen erlaubt sind (N, E, S, W, NE, SE, SW, NW)"
+
+    return g_s_windows
+
+
+
+
+
+
+if __name__=='__main__':
+    pass
