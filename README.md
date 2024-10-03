@@ -13,15 +13,15 @@ Download the repository and open the `Setup_Simulation.py`, modify the `main_pat
 
 **To run the global sensitivity analysis**, the files `multi_core_sa_main_big_2.py`and `multi_core_sa_model_big_2.py.` are needed. Specify in both the file directories. In the main file, the parameters can be adjusted (distribution and exclusion of some designs); the model file should not be adjusted except when different electricity grid decarbonization scenarios or fixed buildings RSP are used. 
 
-**To assess intervention designs under uncertainty** the files `multi_core_main_robust_assessment.py`and `multi_core_model_big_2.py.` are needed. Specify in both the file directories. In the main file, the parameters can be adjusted (distribution and exclusion of some designs); the model file should not be adjusted except when other electricity grid decarbonization scenarios are applied. 
+**To assess intervention designs under uncertainty** the files `multi_core_main_robust_assessment.py`and `multi_core_model_big_2.py.` are needed. Specify in both the file directories. In the main file, the parameters can be adjusted (distribution and exclusion of some designs); the model file should not be adjusted except when other electricity grid decarbonization scenarios are applied. The results are saved as a .csv file in the folder `evaluation/robust_evaluation`. The columns labeling and units information can be found in the Excel file `infos_to_output_data.xlsx`
 * For the default configuration, the designs of the thesis are assessed 
 * To assess other intervention designs, just edit the `intervention_designs.xlsx` Excel with adding new designs, name the column *scenario_group* like the variable *scenario_group_multi* in the `multi_core_main_robust_assessment.py`file. 
 * To assess other buildings/archetypes, create new ones in excel `Case_study_for_validation.xlsx`, refer to those in the `intervention_designs.xlsx` Excel (*original_building_archetype* column)
 
 ## Files Structure
 * **To assess intervention designs under uncertainty**: `multi_core_main_robust_assessment.py`and `multi_core_model_big_2.py.`
-* To run the global sensitivity analysis**: `multi_core_sa_main_big_2.py`and `multi_core_sa_model_big_2.py.`
-* ***Deterministic evaluation of one building**: `Scenario_Configurator.py`
+* **To run the global sensitivity analysis**: `multi_core_sa_main_big_2.py`and `multi_core_sa_model_big_2.py.`
+* **Deterministic evaluation of one building**: `Scenario_Configurator.py`
 
 
 ### FUNCTIONS
